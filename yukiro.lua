@@ -1,5 +1,5 @@
--- Lua script Roblox (LocalScript) - Bổ sung thông báo "on script ✅ animation"
--- Hợp nhất toàn bộ chức năng: ESP, Aimbot, FPS Booster, Hitbox Extender
+-- Lua script Roblox (LocalScript) - Cải thiện Aimbot
+-- Tăng độ mượt, dự đoán di chuyển, ưu tiên mục tiêu gần tâm FOV nhất
 
 if _G.MegaScriptExecuted then return end
 _G.MegaScriptExecuted = true
@@ -46,7 +46,6 @@ local function ShowNotification()
     Label.ZIndex = 10000
     Label.Parent = Frame
 
-    -- Animation phóng to thu nhỏ
     local TweenService = game:GetService("TweenService")
     local tweenInfo = TweenInfo.new(0.8, Enum.EasingStyle.Bounce, Enum.EasingDirection.Out)
     local scaleUp = TweenService:Create(Frame, tweenInfo, {Size = UDim2.new(0, 300, 0, 70)})
@@ -57,7 +56,6 @@ local function ShowNotification()
         scaleDown:Play()
     end)
 
-    -- Tự hủy sau 3 giây
     task.delay(3.5, function()
         local fadeOut = TweenService:Create(Frame, TweenInfo.new(0.5, Enum.EasingStyle.Linear), {BackgroundTransparency = 1})
         fadeOut:Play()
@@ -66,7 +64,6 @@ local function ShowNotification()
         end)
     end)
 
-    -- Hiệu ứng chữ nhấp nháy
     task.spawn(function()
         local blink = true
         for i = 1, 6 do
@@ -80,7 +77,7 @@ end
 
 task.spawn(ShowNotification)
 
--- ====== PHẦN 1: SMART FPS BOOSTER + HITBOX EXTENDER ======
+-- ====== PHẦN 1: FPS BOOSTER (CHỈ GIẢM ĐỒ HỌA) ======
 local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
@@ -157,6 +154,22 @@ for _, child in ipairs(Lighting:GetChildren()) do
     end
 end
 
+pcall(function()
+    game:GetService("UserSettings"):GetService("UserGameSettings").GraphicsQualityLevel = Enum.QualityLevel.Level01
+end)
+
+local function FreeMemory()
+    collectgarbage("collect")
+end
+
+task.spawn(function()
+    while true do
+        task.wait(30)
+        pcall(FreeMemory)
+    end
+end)
+
+-- ====== PHẦN 2: HITBOX EXTENDER ======
 local HitboxSize = Vector3.new(6, 6, 6)
 local IgnoredPlayers = {}
 
@@ -195,55 +208,7 @@ task.spawn(function()
     end
 end)
 
-local function HideFarPlayers()
-    local root = Character and Character:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-    local myPos = root.Position
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local otherChar = player.Character
-            if otherChar then
-                local otherRoot = otherChar:FindFirstChild("HumanoidRootPart")
-                if otherRoot then
-                    local dist = (myPos - otherRoot.Position).Magnitude
-                    if dist > 250 then
-                        if otherChar.Parent == Workspace then
-                            otherChar.Parent = nil
-                        end
-                    else
-                        if otherChar.Parent == nil then
-                            otherChar.Parent = Workspace
-                            task.spawn(ExpandHitbox, player)
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-task.spawn(function()
-    while true do
-        task.wait(3)
-        pcall(HideFarPlayers)
-    end
-end)
-
-local function FreeMemory()
-    collectgarbage("collect")
-    pcall(function()
-        game:GetService("UserSettings"):GetService("UserGameSettings").GraphicsQualityLevel = Enum.QualityLevel.Level01
-    end)
-end
-
-task.spawn(function()
-    while true do
-        task.wait(20)
-        pcall(FreeMemory)
-    end
-end)
-
--- ====== PHẦN 2: ESP + AIMBOT (FOV 40) ======
+-- ====== PHẦN 3: ESP + AIMBOT CẢI THIỆN ======
 local CoreGui = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
 local Camera = workspace.CurrentCamera
@@ -251,7 +216,8 @@ local Camera = workspace.CurrentCamera
 local CONFIG = {
     FOV_RADIUS = 40,
     TARGET_PART = "Head",
-    SMOOTHNESS = 0.22,
+    SMOOTHNESS = 0.35,           -- Tăng độ mượt (0.35 thay vì 0.22)
+    PREDICTION_FACTOR = 0.3,     -- Dự đoán di chuyển 30%
     SWIPE_THRESHOLD = 80,
     ESP_ENABLED = true,
     ESP_THICKNESS = 2,
@@ -349,9 +315,33 @@ local function IsSameTeam(player)
     return LocalPlayer.Team and player.Team and LocalPlayer.Team == player.Team
 end
 
-local function GetClosestTarget()
-    local closest, shortest = nil, math.huge
+-- HÀM TÍNH KHOẢNG CÁCH TỪ ĐIỂM ĐẾN TÂM FOV (CÓ TRỌNG SỐ)
+local function GetScore(targetPart, targetVelocity)
     local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
+    if not onScreen then return math.huge end
+    
+    local distFromCenter = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+    if distFromCenter > CONFIG.FOV_RADIUS then return math.huge end
+    
+    -- Dự đoán vị trí dựa trên vận tốc (nếu có)
+    local predictedPos = targetPart.Position
+    if targetVelocity and targetVelocity.Magnitude > 1 then
+        predictedPos = predictedPos + (targetVelocity * CONFIG.PREDICTION_FACTOR)
+        local predScreen, predOn = Camera:WorldToViewportPoint(predictedPos)
+        if predOn then
+            local predDist = (Vector2.new(predScreen.X, predScreen.Y) - center).Magnitude
+            -- Kết hợp khoảng cách hiện tại và dự đoán (ưu tiên gần tâm hơn)
+            return distFromCenter * 0.6 + predDist * 0.4
+        end
+    end
+    
+    return distFromCenter
+end
+
+local function GetClosestTarget()
+    local bestTarget = nil
+    local bestScore = math.huge
     local camPos = Camera.CFrame.Position
 
     for _, player in ipairs(Players:GetPlayers()) do
@@ -365,29 +355,44 @@ local function GetClosestTarget()
         local hum = char:FindFirstChildOfClass("Humanoid")
         if not targetPart or not hum or hum.Health <= 0 then continue end
 
-        local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
-        if not onScreen then continue end
+        -- Lấy vận tốc của nhân vật (nếu có)
+        local velocity = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart.AssemblyLinearVelocity or Vector3.new(0,0,0)
 
-        local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
-        if dist > CONFIG.FOV_RADIUS then continue end
+        local score = GetScore(targetPart, velocity)
+        if score == math.huge then continue end
 
+        -- Kiểm tra vật cản
         local params = RaycastParams.new()
         params.FilterDescendantsInstances = {LocalPlayer.Character or {}, char}
         params.FilterType = Enum.RaycastFilterType.Exclude
         local ray = workspace:Raycast(camPos, targetPart.Position - camPos, params)
 
-        if not ray and dist < shortest then
-            closest, shortest = player, dist
+        if not ray and score < bestScore then
+            bestTarget = player
+            bestScore = score
         end
     end
-    return closest
+    return bestTarget
 end
 
 local function UpdateCamera(targetPos)
     if not targetPos then return end
     local current = Camera.CFrame
     local target = CFrame.lookAt(current.Position, targetPos)
-    Camera.CFrame = current:Lerp(target, CONFIG.SMOOTHNESS)
+    
+    -- Sử dụng SMOOTHNESS cao hơn để mượt mà hơn
+    local smoothFactor = CONFIG.SMOOTHNESS
+    -- Nếu target ở xa tâm, tăng tốc độ bám
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local screenPos, onScreen = Camera:WorldToViewportPoint(targetPos)
+    if onScreen then
+        local distFromCenter = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+        if distFromCenter > CONFIG.FOV_RADIUS * 0.7 then
+            smoothFactor = math.min(smoothFactor * 1.5, 0.6) -- Bám nhanh hơn khi target ở rìa FOV
+        end
+    end
+    
+    Camera.CFrame = current:Lerp(target, smoothFactor)
 end
 
 local lastTouchPos = nil
@@ -427,6 +432,8 @@ local function MainUpdate()
             CurrentTarget = nil
             return
         end
+        
+        -- Kiểm tra target có còn trong FOV không
         local screenPos, onScreen = Camera:WorldToViewportPoint(targetPart.Position)
         if not onScreen then
             CurrentTarget = nil
@@ -438,6 +445,17 @@ local function MainUpdate()
             CurrentTarget = nil
             return
         end
+        
+        -- Kiểm tra vật cản
+        local camPos = Camera.CFrame.Position
+        local params = RaycastParams.new()
+        params.FilterDescendantsInstances = {LocalPlayer.Character or {}, char}
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        local ray = workspace:Raycast(camPos, targetPart.Position - camPos, params)
+        if ray then
+            CurrentTarget = nil
+            return
+        end
     end
 
     if CurrentTarget then
@@ -445,7 +463,13 @@ local function MainUpdate()
         if not char then CurrentTarget = nil return end
         local targetPart = char:FindFirstChild(CONFIG.TARGET_PART)
         if targetPart then
-            UpdateCamera(targetPart.Position)
+            -- Dự đoán vị trí dựa trên vận tốc để aim trước
+            local velocity = char:FindFirstChild("HumanoidRootPart") and char.HumanoidRootPart.AssemblyLinearVelocity or Vector3.new(0,0,0)
+            local predictedPos = targetPart.Position
+            if velocity.Magnitude > 1 then
+                predictedPos = predictedPos + (velocity * CONFIG.PREDICTION_FACTOR)
+            end
+            UpdateCamera(predictedPos)
         end
     end
 end
@@ -461,4 +485,4 @@ Players.PlayerRemoving:Connect(function(plr)
     end
 end)
 
-print("✅ Mega Script đã kích hoạt: ESP + Aimbot (FOV 40) + FPS Booster + Hitbox Extender + Animation ✅")
+print("✅ Script đã kích hoạt: ESP + Aimbot cải thiện (dự đoán di chuyển, độ mượt cao) + FPS Booster + Hitbox Extender ✅")
