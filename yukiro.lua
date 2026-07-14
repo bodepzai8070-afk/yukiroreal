@@ -1,345 +1,286 @@
--- [[ Smart FPS Booster + Hitbox Extender + Aimbot 180° FOV + Lock Target (Delta Executor) ]]
--- Nâng cấp: FOV 180°, ưu tiên head, bù lead, silent aim, tự động bắn liên tục, chống giật
+-- Đợi game tải hoàn toàn
+if not game:IsLoaded() then game.Loaded:Wait() end
 
-if _G.SmartFPSBoosterExecuted then return end
-_G.SmartFPSBoosterExecuted = true
-
-local Workspace = game:GetService("Workspace")
-local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local HttpService = game:GetService("HttpService")
 local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local Camera = Workspace.CurrentCamera
+local Camera = workspace.CurrentCamera
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- Cấu hình nâng cao
-local CONFIG = {
-    FOV = 180,                    -- Quét full 180°
-    SMOOTH = 0.05,                -- Làm mượt cực nhanh
-    TARGET_DISTANCE = 99999,      -- Không giới hạn khoảng cách
-    HITBOX_SIZE = Vector3.new(12, 12, 12),
-    SHOOT_INTERVAL = 0.015,       -- Bắn liên tục ~66 phát/giây
-    LEAD_FACTOR = 0.4,            -- Bù đạn cho mục tiêu di chuyển
-    SILENT_AIM = true,            -- Chỉ xoay camera ảo (không hiện cho server)
-    AUTO_SHOOT = true,
-    HIDE_DISTANCE = 400,
-}
+-- Cấu hình
+local AimbotEnabled = true
+local FOV_RADIUS = 35
+local TARGET_PART = "Head"
+local SMOOTH_FACTOR = 0.25  -- Độ mượt xoay (0.1-0.5)
+local UNLOCK_SWIPE_THRESHOLD = 35 -- pixel vuốt để unlock
 
-local ImportantNames = {
-    "Baseplate", "SpawnLocation", "Floor", "Ground", "Sàn",
-    "Checkpoint", "Teleport", "Terrain"
-}
-local function IsImportant(part)
-    if not part then return false end
-    local name = part.Name:lower()
-    for _, v in ipairs(ImportantNames) do
-        if name == v:lower() then return true end
-    end
-    if name:find("floor") or name:find("plate") or name:find("terrain") then return true end
-    return false
+-- Drawing objects
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness = 2
+FOVCircle.Color = Color3.fromRGB(0, 0, 0)  -- BLACK
+FOVCircle.Filled = false
+FOVCircle.Radius = FOV_RADIUS
+FOVCircle.Visible = true
+FOVCircle.Transparency = 0.8
+
+-- ESP: Text cho tên và khoảng cách
+local ESPLabels = {}
+local function createESPLabel(player)
+    if ESPLabels[player] then return end
+    local label = Drawing.new("Text")
+    label.Size = 16
+    label.Color = Color3.fromRGB(255, 255, 255)
+    label.Center = true
+    label.Outline = true
+    label.OutlineColor = Color3.fromRGB(0, 0, 0)
+    label.Visible = false
+    ESPLabels[player] = label
 end
 
--- Tối ưu FPS cực mạnh
-local function SmartOptimize(obj)
-    if not obj then return end
-    if obj:IsA("BasePart") or obj:IsA("MeshPart") then
-        if not IsImportant(obj) then
-            obj.Material = Enum.Material.SmoothPlastic
-            obj.CastShadow = false
-            obj.Reflectance = 0
-            obj.Transparency = 0.5  -- Giảm tải render
-            if obj:IsA("MeshPart") then
-                obj.TextureID = ""
-                if obj.MeshId ~= "" then obj.MeshId = "" end
+local function updateESP()
+    local camPos = Camera.CFrame.Position
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local label = ESPLabels[player]
+        if not label then createESPLabel(player) end
+        
+        local char = player.Character
+        if char and char:FindFirstChild(TARGET_PART) and char:FindFirstChildOfClass("Humanoid") then
+            local humanoid = char:FindFirstChildOfClass("Humanoid")
+            if humanoid.Health > 0 then
+                local head = char[TARGET_PART]
+                local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+                if onScreen then
+                    local dist = (camPos - head.Position).Magnitude
+                    label.Text = string.format("%s [%.1fm]", player.Name, dist)
+                    label.Position = Vector2.new(screenPos.X, screenPos.Y - 30)
+                    label.Visible = true
+                    label.Color = (dist < 30) and Color3.fromRGB(255, 50, 50) or Color3.fromRGB(255, 255, 255)
+                else
+                    label.Visible = false
+                end
+            else
+                label.Visible = false
+            end
+        else
+            label.Visible = false
+        end
+    end
+end
+
+-- Hàm tìm mục tiêu (tối ưu)
+local function getClosestPlayer()
+    local closest = nil
+    local shortestDist = math.huge
+    local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local camPos = Camera.CFrame.Position
+    local ignoreList = {LocalPlayer.Character}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local char = player.Character
+        if not char then continue end
+        local head = char:FindFirstChild(TARGET_PART)
+        if not head then continue end
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        if not humanoid or humanoid.Health <= 0 then continue end
+
+        -- Line-of-sight check
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {LocalPlayer.Character, char}
+        local ray = workspace:Raycast(camPos, head.Position - camPos, params)
+        if ray then continue end
+
+        local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+        if not onScreen then continue end
+
+        local dist2D = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+        if dist2D <= FOV_RADIUS and dist2D < shortestDist then
+            closest = player
+            shortestDist = dist2D
+        end
+    end
+    return closest
+end
+
+-- Biến theo dõi vuốt để unlock
+local lastSwipeDelta = 0
+local currentTarget = nil
+
+-- Vòng lặp RenderStepped – SỬA LỖI CAMERA FIRST-PERSON
+local aimConnection
+local function startAimbot()
+    aimConnection = RunService.RenderStepped:Connect(function()
+        local screenCenter = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        FOVCircle.Position = screenCenter
+
+        -- Cập nhật ESP
+        updateESP()
+
+        if not AimbotEnabled then return end
+
+        local targetPlayer = getClosestPlayer()
+        currentTarget = targetPlayer
+
+        if targetPlayer and targetPlayer.Character then
+            local targetHead = targetPlayer.Character:FindFirstChild(TARGET_PART)
+            if targetHead then
+                local targetPos = targetHead.Position
+                local camPos = Camera.CFrame.Position
+                
+                -- Cách ép camera xoay mượt KHÔNG bị override bởi touch
+                local lookAtCF = CFrame.lookAt(camPos, targetPos)
+                -- Nội suy góc để xoay mượt
+                local currentCF = Camera.CFrame
+                local targetCF = lookAtCF
+                -- Chỉ xoay quanh Y và X để tránh lật
+                local currentAngles = currentCF:ToEulerAnglesYXZ()
+                local targetAngles = targetCF:ToEulerAnglesYXZ()
+                
+                -- Lấy góc chênh lệch, áp dụng nội suy (smooth)
+                local deltaY = targetAngles - currentAngles
+                -- Chuẩn hóa góc để tránh xoay vòng
+                deltaY = (deltaY + math.pi) % (2 * math.pi) - math.pi
+                
+                local newY = currentAngles + deltaY * SMOOTH_FACTOR
+                local newX = currentAngles + (targetAngles - currentAngles) * SMOOTH_FACTOR
+                
+                -- Áp dụng CFrame mới
+                Camera.CFrame = CFrame.new(camPos) * CFrame.Angles(newX, newY, 0)
             end
         end
-    end
-    if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or obj:IsA("Fire") or
-       obj:IsA("Sparkles") or obj:IsA("Trail") or obj:IsA("Beam") or
-       obj:IsA("Attachment") or obj:IsA("Sound") then
-        obj:Destroy()
-        return
-    end
-    if (obj:IsA("Decal") or obj:IsA("Texture")) then
-        local parent = obj.Parent
-        if parent and not IsImportant(parent) then obj:Destroy() end
-    end
-    if obj:IsA("WedgePart") or obj:IsA("CornerWedgePart") then
-        obj.Material = Enum.Material.Plastic
-    end
-end
-
-task.spawn(function()
-    local allParts = Workspace:GetDescendants()
-    local count = 0
-    for _, obj in ipairs(allParts) do
-        count = count + 1
-        SmartOptimize(obj)
-        if count % 200 == 0 then RunService.Heartbeat:Wait() end
-    end
-    -- Xóa terrain chi tiết nếu có
-    pcall(function()
-        if Workspace.Terrain then
-            Workspace.Terrain.WaterWaveSize = 0
-            Workspace.Terrain.WaterReflectance = 0
-            Workspace.Terrain.WaterTransparency = 1
-        end
     end)
+end
+
+-- Phát hiện vuốt mạnh để unlock
+UserInputService.TouchEnabled = true
+UserInputService.TouchStarted:Connect(function(input, processed)
+    if processed then return end
+    lastSwipeDelta = 0
 end)
 
-Workspace.DescendantAdded:Connect(function(obj)
-    task.wait(0.1)
-    if obj:IsA("Model") and obj:FindFirstChild("Humanoid") then
-        if obj == Character then return end
+UserInputService.TouchMoved:Connect(function(input, processed)
+    if processed or not currentTarget then return end
+    local delta = input.Delta.Magnitude
+    lastSwipeDelta = lastSwipeDelta + delta
+    if lastSwipeDelta > UNLOCK_SWIPE_THRESHOLD then
+        -- Unlock: reset mục tiêu
+        currentTarget = nil
+        lastSwipeDelta = 0
     end
-    SmartOptimize(obj)
 end)
 
--- Lighting tối giản
-Lighting.GlobalShadows = false
-Lighting.Brightness = 0.5
-Lighting.Ambient = Color3.fromRGB(80,80,80)
-Lighting.ClockTime = 12
-Lighting.FogEnd = 100000
-for _, child in ipairs(Lighting:GetChildren()) do
-    if child:IsA("BlurEffect") or child:IsA("SunRaysEffect") or
-       child:IsA("BloomEffect") or child:IsA("DepthOfFieldEffect") or
-       child:IsA("ColorCorrectionEffect") then
-        child:Destroy()
+UserInputService.TouchEnded:Connect(function()
+    lastSwipeDelta = 0
+end)
+
+local function stopAimbot()
+    if aimConnection then
+        aimConnection:Disconnect()
+        aimConnection = nil
+    end
+    FOVCircle.Visible = false
+    -- Ẩn tất cả ESP
+    for _, label in pairs(ESPLabels) do
+        label.Visible = false
     end
 end
 
--- ===== HITBOX EXPANDER + KHÔNG COLLIDE =====
-local HitboxSize = CONFIG.HITBOX_SIZE
-local function ExpandHitbox(player)
-    if player == LocalPlayer then return end
-    local char = player.Character
-    if not char then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-    hrp.Size = HitboxSize
-    hrp.CanCollide = false
-    hrp.Massless = true
-    -- Mở rộng tất cả các bộ phận khác
-    for _, part in ipairs(char:GetChildren()) do
-        if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-            part.Size = HitboxSize * 0.8
-            part.CanCollide = false
-        end
-    end
+startAimbot()
+
+-- Tạo GUI Toggle (Draggable)
+if PlayerGui:FindFirstChild("MobileAimbotGui") then
+    PlayerGui.MobileAimbotGui:Destroy()
 end
 
-for _, p in ipairs(Players:GetPlayers()) do
-    if p ~= LocalPlayer then task.spawn(ExpandHitbox, p) end
+local ScreenGui = Instance.new("ScreenGui")
+local ToggleButton = Instance.new("TextButton")
+local UICorner = Instance.new("UICorner")
+
+ScreenGui.Name = "MobileAimbotGui"
+ScreenGui.Parent = PlayerGui
+ScreenGui.ResetOnSpawn = false
+
+ToggleButton.Name = "ToggleButton"
+ToggleButton.Parent = ScreenGui
+ToggleButton.BackgroundColor3 = Color3.fromRGB(0, 0, 0)  -- BLACK
+ToggleButton.Position = UDim2.new(0.15, 0, 0.25, 0)
+ToggleButton.Size = UDim2.new(0, 85, 0, 40)
+ToggleButton.Font = Enum.Font.SourceSansBold
+ToggleButton.Text = "AIM: ON"
+ToggleButton.TextColor3 = Color3.fromRGB(0, 255, 0)
+ToggleButton.TextSize = 16
+ToggleButton.Active = true
+
+UICorner.CornerRadius = UDim.new(0, 10)
+UICorner.Parent = ToggleButton
+
+-- Kéo thả
+local dragging, dragInput, dragStart, startPos
+local function update(input)
+    local delta = input.Position - dragStart
+    ToggleButton.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+ToggleButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = ToggleButton.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+ToggleButton.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        update(input)
+    end
+end)
+
+ToggleButton.MouseButton1Click:Connect(function()
+    AimbotEnabled = not AimbotEnabled
+    if AimbotEnabled then
+        ToggleButton.Text = "AIM: ON"
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+        ToggleButton.TextColor3 = Color3.fromRGB(0, 255, 0)
+        FOVCircle.Visible = true
+        if not aimConnection then startAimbot() end
+    else
+        ToggleButton.Text = "AIM: OFF"
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+        ToggleButton.TextColor3 = Color3.fromRGB(255, 0, 0)
+        stopAimbot()
+    end
+end)
+
+-- Khởi tạo ESP cho các player hiện có
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= LocalPlayer then
+        createESPLabel(player)
+    end
 end
 
 Players.PlayerAdded:Connect(function(player)
-    player.CharacterAdded:Connect(function()
-        task.wait(0.3)
-        ExpandHitbox(player)
-    end)
-end)
-
-task.spawn(function()
-    while true do
-        task.wait(3)
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then pcall(ExpandHitbox, p) end
-        end
+    if player ~= LocalPlayer then
+        createESPLabel(player)
     end
 end)
 
--- ===== AIMBOT 180° + SILENT + LEAD =====
-local AimbotEnabled = true
-local AutoShoot = CONFIG.AUTO_SHOOT
-local CurrentTarget = nil
-
-local function GetHeadPosition(player)
-    local char = player.Character
-    if not char then return nil end
-    local head = char:FindFirstChild("Head")
-    if head and head:IsA("BasePart") then return head.Position end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp then return hrp.Position + Vector3.new(0, 1.8, 0) end
-    return nil
-end
-
-local function GetVelocity(player)
-    local char = player.Character
-    if not char then return Vector3.new(0,0,0) end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp and hrp:IsA("BasePart") then
-        return hrp.Velocity
-    end
-    return Vector3.new(0,0,0)
-end
-
-local function GetClosestTarget()
-    local bestTarget = nil
-    local bestScore = math.huge
-    local myRoot = Character and Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil end
-    local myPos = myRoot.Position
-    local cameraCF = Camera.CFrame
-    local cameraPos = cameraCF.Position
-    local cameraDir = cameraCF.LookVector
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local headPos = GetHeadPosition(player)
-            if headPos then
-                local dist = (myPos - headPos).Magnitude
-                if dist > CONFIG.TARGET_DISTANCE then continue end
-                local dirToTarget = (headPos - cameraPos).Unit
-                local dot = cameraDir:Dot(dirToTarget)
-                local angle = math.deg(math.acos(dot))
-                if angle > CONFIG.FOV then continue end
-                -- Ưu tiên gần + góc nhỏ
-                local score = angle * 0.3 + dist * 0.0005
-                if score < bestScore then
-                    bestScore = score
-                    bestTarget = player
-                end
-            end
-        end
-    end
-    return bestTarget
-end
-
--- Silent Aim (chỉ xoay camera local, server không phát hiện)
-local function SilentAim(targetPlayer)
-    if not targetPlayer then return end
-    local headPos = GetHeadPosition(targetPlayer)
-    if not headPos then return end
-    -- Bù lead
-    local vel = GetVelocity(targetPlayer)
-    local leadOffset = vel * CONFIG.LEAD_FACTOR
-    local targetPos = headPos + leadOffset
-    
-    local newCF = CFrame.new(Camera.CFrame.Position, targetPos)
-    if CONFIG.SMOOTH > 0 then
-        Camera.CFrame = Camera.CFrame:Lerp(newCF, CONFIG.SMOOTH)
-    else
-        Camera.CFrame = newCF
-    end
-end
-
--- Bắn tự động với tốc độ cao
-local function Shoot()
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-    task.wait(CONFIG.SHOOT_INTERVAL)
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-end
-
--- Vòng lặp chính
-RunService.RenderStepped:Connect(function()
-    if not AimbotEnabled then return end
-    if not Character or not Character.Parent then return end
-    local target = GetClosestTarget()
-    CurrentTarget = target
-    if target then
-        if CONFIG.SILENT_AIM then
-            SilentAim(target)
-        else
-            -- Nếu không silent thì dùng aim thường
-            local headPos = GetHeadPosition(target)
-            if headPos then
-                local newCF = CFrame.new(Camera.CFrame.Position, headPos)
-                Camera.CFrame = Camera.CFrame:Lerp(newCF, CONFIG.SMOOTH)
-            end
-        end
-        if AutoShoot then
-            Shoot()
-        end
+Players.PlayerRemoving:Connect(function(player)
+    if ESPLabels[player] then
+        ESPLabels[player]:Remove()
+        ESPLabels[player] = nil
     end
 end)
-
--- Phím F bật/tắt, phím G bật/tắt auto shoot
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if input.KeyCode == Enum.KeyCode.F then
-        AimbotEnabled = not AimbotEnabled
-        print("Aimbot 180°: " .. (AimbotEnabled and "BẬT" or "TẮT"))
-    end
-    if input.KeyCode == Enum.KeyCode.G then
-        AutoShoot = not AutoShoot
-        print("Auto Shoot: " .. (AutoShoot and "BẬT" or "TẮT"))
-    end
-end)
-
--- ===== ẨN NGƯỜI CHƠI XA + TELEPORT NGƯỢC =====
-local hiddenPlayers = {}
-local function HideFarPlayers()
-    local root = Character and Character:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-    local myPos = root.Position
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local otherChar = player.Character
-            if otherChar then
-                local otherRoot = otherChar:FindFirstChild("HumanoidRootPart")
-                if otherRoot then
-                    local dist = (myPos - otherRoot.Position).Magnitude
-                    if dist > CONFIG.HIDE_DISTANCE then
-                        if otherChar.Parent == Workspace then
-                            otherChar.Parent = nil
-                            hiddenPlayers[player.UserId] = otherChar
-                        end
-                    else
-                        if otherChar.Parent == nil and hiddenPlayers[player.UserId] then
-                            hiddenPlayers[player.UserId].Parent = Workspace
-                            hiddenPlayers[player.UserId] = nil
-                            task.spawn(ExpandHitbox, player)
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-task.spawn(function()
-    while true do
-        task.wait(2)
-        pcall(HideFarPlayers)
-    end
-end)
-
--- ===== GIẢI PHÓNG RAM TỐI ĐA =====
-local function FreeMemory()
-    collectgarbage("collect")
-    collectgarbage("step", 1000)
-    pcall(function()
-        game:GetService("UserSettings"):GetService("UserGameSettings").GraphicsQualityLevel = Enum.QualityLevel.Level01
-        settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-    end)
-    -- Xóa các đối tượng rác
-    for _, v in pairs(Workspace:GetChildren()) do
-        if v:IsA("Part") and v.Name == "" and v:GetChildren()[1] == nil then
-            v:Destroy()
-        end
-    end
-end
-
-task.spawn(function()
-    while true do
-        task.wait(15)
-        pcall(FreeMemory)
-    end
-end)
-
--- ===== CHỐNG CRASH =====
-pcall(function()
-    game:GetService("ScriptContext").Error:Connect(function(msg, stack)
-        if string.find(msg, "Too many") or string.find(msg, "out of memory") then
-            FreeMemory()
-        end
-    end)
-end)
-
-print("=== AIMBOT 180° SILENT + AUTO SHOOT + FPS BOOST ===")
-print("F: Bật/tắt aimbot | G: Bật/tắt auto bắn")
-print("Hitbox mở rộng x12, lead bù đạn, silent aim")
