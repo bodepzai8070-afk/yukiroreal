@@ -1,5 +1,5 @@
--- [[ Smart FPS Booster + Hitbox Extender + Aimbot 120° FOV (Delta Executor) ]]
--- Quét góc 120 độ, ưu tiên mục tiêu gần nhất trong tầm
+-- [[ Smart FPS Booster + Hitbox Extender (Delta Executor) ]]
+-- Bổ sung: phóng to hitbox người chơi khác để dễ bắn hơn
 
 if _G.SmartFPSBoosterExecuted then return end
 _G.SmartFPSBoosterExecuted = true
@@ -8,11 +8,8 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 local LocalPlayer = Players.LocalPlayer
 local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-local Camera = Workspace.CurrentCamera
 
 -- Danh sách bảo vệ Map
 local ImportantNames = {
@@ -29,7 +26,7 @@ local function IsImportant(part)
     return false
 end
 
--- Tối ưu hóa thông minh
+-- Hàm tối ưu thông minh
 local function SmartOptimize(obj)
     if not obj then return end
     if obj:IsA("BasePart") or obj:IsA("MeshPart") then
@@ -55,15 +52,19 @@ local function SmartOptimize(obj)
     end
 end
 
-task.spawn(function()
+-- Quét map ban đầu
+local function ScanMap()
     local allParts = Workspace:GetDescendants()
     local count = 0
     for _, obj in ipairs(allParts) do
         count = count + 1
         SmartOptimize(obj)
-        if count % 150 == 0 then RunService.Heartbeat:Wait() end
+        if count % 150 == 0 then
+            RunService.Heartbeat:Wait()
+        end
     end
-end)
+end
+task.spawn(ScanMap)
 
 Workspace.DescendantAdded:Connect(function(obj)
     if obj:IsA("Model") and obj:FindFirstChild("Humanoid") then
@@ -72,7 +73,7 @@ Workspace.DescendantAdded:Connect(function(obj)
     SmartOptimize(obj)
 end)
 
--- Lighting
+-- Tối ưu Lighting
 Lighting.GlobalShadows = false
 Lighting.Brightness = 1
 Lighting.ClockTime = 12
@@ -83,123 +84,57 @@ for _, child in ipairs(Lighting:GetChildren()) do
     end
 end
 
--- ===== HITBOX EXPANDER =====
-local HitboxSize = Vector3.new(8, 8, 8)
+-- ===== HITBOX EXPANDER CHO PLAYER KHÁC =====
+local HitboxSize = Vector3.new(6, 6, 6)  -- kích thước hitbox (điều chỉnh tùy ý)
+local IgnoredPlayers = {}  -- nếu muốn bỏ qua ai đó
+
 local function ExpandHitbox(player)
     if player == LocalPlayer then return end
+    if IgnoredPlayers[player] then return end
     local char = player.Character
     if not char then return end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
+    -- Chỉ phóng to hitbox của RootPart (không làm biến dạng model)
     hrp.Size = HitboxSize
-    hrp.CanCollide = false
+    hrp.CanCollide = false  -- tránh đẩy vật lý
+    -- Kéo theo các phần khác (tay, chân) để không bị lỗi nếu muốn
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("BasePart") and child ~= hrp then
+            -- Không thay đổi size, chỉ bảo đảm chúng nằm gọn trong hitbox
+            -- Hoặc có thể set Size theo tỉ lệ nhỏ hơn
+        end
+    end
 end
 
+-- Quét tất cả người chơi hiện tại
 for _, p in ipairs(Players:GetPlayers()) do
-    if p ~= LocalPlayer then task.spawn(ExpandHitbox, p) end
+    if p ~= LocalPlayer then
+        task.spawn(ExpandHitbox, p)
+    end
 end
 
+-- Đón đầu khi người chơi mới xuất hiện
 Players.PlayerAdded:Connect(function(player)
-    player.CharacterAdded:Connect(function()
-        task.wait(0.5)
+    player.CharacterAdded:Connect(function(char)
+        task.wait(0.5)  -- đợi load xong
         ExpandHitbox(player)
     end)
 end)
 
+-- Lặp lại mỗi 5 giây để fix các phần bị reset
 task.spawn(function()
     while true do
         task.wait(5)
         for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then pcall(ExpandHitbox, p) end
-        end
-    end
-end)
-
--- ===== AIMBOT 120° FOV - GHIM HEAD =====
-local AimbotEnabled = true
-local TargetDistance = 9999
-local FOV = 120  -- ĐÃ ĐỔI TỪ 30 -> 120 ĐỘ
-local Smoothness = 0
-
-local function GetHeadPosition(player)
-    local char = player.Character
-    if not char then return nil end
-    local head = char:FindFirstChild("Head")
-    if head then return head.Position end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if hrp then return hrp.Position + Vector3.new(0, 1.5, 0) end
-    return nil
-end
-
-local function GetClosestTarget()
-    local bestTarget = nil
-    local bestScore = math.huge
-    local myRoot = Character and Character:FindFirstChild("HumanoidRootPart")
-    if not myRoot then return nil end
-    local myPos = myRoot.Position
-    local cameraCF = Camera.CFrame
-    local cameraPos = cameraCF.Position
-    local cameraDir = cameraCF.LookVector
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local headPos = GetHeadPosition(player)
-            if headPos then
-                local dist = (myPos - headPos).Magnitude
-                if dist > TargetDistance then continue end
-                local dirToTarget = (headPos - cameraPos).Unit
-                local dot = cameraDir:Dot(dirToTarget)
-                local angle = math.deg(math.acos(dot))
-                if angle > FOV then continue end  -- Chỉ nhận trong 120°
-                local score = angle * 0.5 + dist * 0.001
-                if score < bestScore then
-                    bestScore = score
-                    bestTarget = player
-                end
+            if p ~= LocalPlayer then
+                pcall(ExpandHitbox, p)
             end
         end
     end
-    return bestTarget
-end
-
-local function AimAt(targetPlayer)
-    if not targetPlayer then return end
-    local headPos = GetHeadPosition(targetPlayer)
-    if not headPos then return end
-    local newCF = CFrame.new(Camera.CFrame.Position, headPos)
-    if Smoothness > 0 then
-        Camera.CFrame = Camera.CFrame:Lerp(newCF, 0.15)
-    else
-        Camera.CFrame = newCF
-    end
-end
-
-local function Shoot()
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, true, game, 1)
-    task.wait(0.01)
-    VirtualInputManager:SendMouseButtonEvent(0, 0, 0, false, game, 1)
-end
-
-RunService.RenderStepped:Connect(function()
-    if not AimbotEnabled then return end
-    if not Character or not Character.Parent then return end
-    local target = GetClosestTarget()
-    if target then
-        AimAt(target)
-        Shoot()
-    end
 end)
 
--- Bật/tắt bằng phím F
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then return end
-    if input.KeyCode == Enum.KeyCode.F then
-        AimbotEnabled = not AimbotEnabled
-        print("Aimbot 120°: " .. (AimbotEnabled and "BẬT" or "TẮT"))
-    end
-end)
-
--- ===== Ẩn người chơi ở xa =====
+-- ===== Ẩn người chơi ở xa (giữ nguyên hitbox khi ẩn) =====
 local function HideFarPlayers()
     local root = Character and Character:FindFirstChild("HumanoidRootPart")
     if not root then return end
@@ -218,6 +153,7 @@ local function HideFarPlayers()
                     else
                         if otherChar.Parent == nil then
                             otherChar.Parent = Workspace
+                            -- Khi hiện lại, áp dụng lại hitbox
                             task.spawn(ExpandHitbox, player)
                         end
                     end
@@ -249,5 +185,4 @@ task.spawn(function()
     end
 end)
 
-print("Smart FPS Booster + Hitbox + Aimbot 120° HEAD đã kích hoạt")
-print("Nhấn F để bật/tắt Aimbot (FOV = 120°)")
+print("Smart FPS Booster + Hitbox Extender đã kích hoạt")
