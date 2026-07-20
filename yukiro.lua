@@ -1,188 +1,271 @@
--- [[ Smart FPS Booster + Hitbox Extender (Delta Executor) ]]
--- Bổ sung: phóng to hitbox người chơi khác để dễ bắn hơn
-
-if _G.SmartFPSBoosterExecuted then return end
-_G.SmartFPSBoosterExecuted = true
-
-local Workspace = game:GetService("Workspace")
-local Lighting = game:GetService("Lighting")
+-- ============================================
+-- CAMERA LOCK-ON SYSTEM V2 - MOBILE FIX
+-- ============================================
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
-local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Camera = workspace.CurrentCamera
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
--- Danh sách bảo vệ Map
-local ImportantNames = {
-    "Baseplate", "SpawnLocation", "Floor", "Ground", "Sàn",
-    "Checkpoint", "Teleport"
+-- ===== CẤU HÌNH =====
+local CONFIG = {
+    FOV_RADIUS = 35,
+    TARGET_PART = "Head",
+    UNLOCK_SENSITIVITY = 0.15,  -- Ngưỡng vuốt để unlock (tính bằng radian)
+    SMOOTH_FACTOR = 0.35        -- Độ mượt khi xoay (0->1, càng thấp càng mượt)
 }
-local function IsImportant(part)
-    if not part then return false end
-    local name = part.Name:lower()
-    for _, v in ipairs(ImportantNames) do
-        if name == v:lower() then return true end
+
+-- ===== STATE =====
+local AimbotEnabled = true
+local CurrentTarget = nil
+local LastTouchDelta = Vector2.new(0, 0)
+local IsTouching = false
+
+-- ===== DRAWING =====
+local FOVCircle = Drawing.new("Circle")
+FOVCircle.Thickness = 1.5
+FOVCircle.Color = Color3.fromRGB(0, 255, 0)
+FOVCircle.Filled = false
+FOVCircle.Radius = CONFIG.FOV_RADIUS
+FOVCircle.Visible = true
+FOVCircle.Transparency = 1
+
+-- ===== HÀM TIỆN: CHUYỂN CFAME -> YAW/PITCH =====
+local function getYawPitch(cframe)
+    local fwd = cframe.LookVector
+    local yaw = math.atan2(-fwd.X, -fwd.Z)
+    local pitch = math.asin(fwd.Y)
+    return yaw, pitch
+end
+
+-- ===== TÌM MỤC TIÊU TỐT NHẤT =====
+local function getClosestPlayer()
+    local best = nil
+    local bestDist = math.huge
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr == LocalPlayer then continue end
+        local char = plr.Character
+        if not char then continue end
+        local head = char:FindFirstChild(CONFIG.TARGET_PART)
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not head or not hum or hum.Health <= 0 then continue end
+        
+        -- Raycast line-of-sight
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {LocalPlayer.Character, char}
+        local origin = Camera.CFrame.Position
+        local dir = head.Position - origin
+        local result = workspace:Raycast(origin, dir, params)
+        if result then continue end
+        
+        -- Check on-screen & FOV
+        local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+        if not onScreen then continue end
+        local dist2D = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+        if dist2D <= CONFIG.FOV_RADIUS and dist2D < bestDist then
+            best = plr
+            bestDist = dist2D
+        end
     end
-    if name:find("floor") or name:find("plate") then return true end
+    return best
+end
+
+-- ===== KIỂM TRA UNLOCK BẰNG VUỐT MÀN HÌNH =====
+local function checkUnlockBySwipe()
+    if not CurrentTarget then return false end
+    local char = CurrentTarget.Character
+    if not char then return true end  -- target died
+    local head = char:FindFirstChild(CONFIG.TARGET_PART)
+    if not head then return true end
+    
+    local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+    if not onScreen then return true end
+    local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+    local dist = (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude
+    
+    -- Nếu target ra khỏi FOV + thêm ngưỡng vuốt
+    if dist > CONFIG.FOV_RADIUS * 1.5 then
+        return true
+    end
+    
+    -- Nếu người chơi vuốt mạnh (dựa trên delta touch)
+    if IsTouching and LastTouchDelta.Magnitude > 25 then  -- pixel
+        return true
+    end
     return false
 end
 
--- Hàm tối ưu thông minh
-local function SmartOptimize(obj)
-    if not obj then return end
-    if obj:IsA("BasePart") or obj:IsA("MeshPart") then
-        if not IsImportant(obj) then
-            obj.Material = Enum.Material.SmoothPlastic
-            obj.CastShadow = false
-            obj.Reflectance = 0
-            if obj:IsA("MeshPart") and obj.TextureID ~= "" then
-                obj.TextureID = ""
+-- ===== CẬP NHẬT CAMERA - KHẮC PHỤC LỖI FIRST-PERSON =====
+local function updateCamera(targetPos)
+    local camPos = Camera.CFrame.Position
+    local targetYaw, targetPitch = getYawPitch(CFrame.lookAt(camPos, targetPos))
+    
+    -- Lấy góc hiện tại của camera
+    local currentYaw, currentPitch = getYawPitch(Camera.CFrame)
+    
+    -- Nội suy góc để xoay mượt, tránh giật
+    local newYaw = currentYaw + (targetYaw - currentYaw) * CONFIG.SMOOTH_FACTOR
+    local newPitch = currentPitch + (targetPitch - currentPitch) * CONFIG.SMOOTH_FACTOR
+    
+    -- Ép buộc CFrame nhưng KHÔNG dùng phép nhân tuyệt đối gây override
+    -- Dùng CFrame.Angles cộng dồn tương đối để không bị touch override
+    local yawDiff = newYaw - currentYaw
+    local pitchDiff = newPitch - currentPitch
+    
+    -- Áp dụng xoay tương đối quanh camera position
+    Camera.CFrame = Camera.CFrame * CFrame.Angles(0, -yawDiff, 0) * CFrame.Angles(pitchDiff, 0, 0)
+end
+
+-- ===== VÒNG LẶP CHÍNH =====
+local aimConnection = nil
+local function startAimbot()
+    if aimConnection then return end
+    aimConnection = RunService.RenderStepped:Connect(function()
+        local center = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        FOVCircle.Position = center
+        
+        if not AimbotEnabled then return end
+        
+        -- Tìm target mới nếu chưa có hoặc target cũ bị unlock
+        if not CurrentTarget or checkUnlockBySwipe() then
+            CurrentTarget = getClosestPlayer()
+            if not CurrentTarget then
+                -- Không có target -> reset touch delta
+                LastTouchDelta = Vector2.new(0, 0)
+                return
             end
         end
-    end
-    if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or obj:IsA("Fire") or
-       obj:IsA("Sparkles") or obj:IsA("Trail") or obj:IsA("Beam") then
-        obj:Destroy()
-        return
-    end
-    if (obj:IsA("Decal") or obj:IsA("Texture")) then
-        local parent = obj.Parent
-        if parent and not IsImportant(parent) then
-            obj:Destroy()
+        
+        -- Lấy vị trí đầu target
+        local head = CurrentTarget.Character and CurrentTarget.Character:FindFirstChild(CONFIG.TARGET_PART)
+        if not head then
+            CurrentTarget = nil
+            return
         end
-    end
-end
-
--- Quét map ban đầu
-local function ScanMap()
-    local allParts = Workspace:GetDescendants()
-    local count = 0
-    for _, obj in ipairs(allParts) do
-        count = count + 1
-        SmartOptimize(obj)
-        if count % 150 == 0 then
-            RunService.Heartbeat:Wait()
-        end
-    end
-end
-task.spawn(ScanMap)
-
-Workspace.DescendantAdded:Connect(function(obj)
-    if obj:IsA("Model") and obj:FindFirstChild("Humanoid") then
-        if obj == Character then return end
-    end
-    SmartOptimize(obj)
-end)
-
--- Tối ưu Lighting
-Lighting.GlobalShadows = false
-Lighting.Brightness = 1
-Lighting.ClockTime = 12
-for _, child in ipairs(Lighting:GetChildren()) do
-    if child:IsA("BlurEffect") or child:IsA("SunRaysEffect") or
-       child:IsA("BloomEffect") or child:IsA("DepthOfFieldEffect") then
-        child:Destroy()
-    end
-end
-
--- ===== HITBOX EXPANDER CHO PLAYER KHÁC =====
-local HitboxSize = Vector3.new(6, 6, 6)  -- kích thước hitbox (điều chỉnh tùy ý)
-local IgnoredPlayers = {}  -- nếu muốn bỏ qua ai đó
-
-local function ExpandHitbox(player)
-    if player == LocalPlayer then return end
-    if IgnoredPlayers[player] then return end
-    local char = player.Character
-    if not char then return end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-    -- Chỉ phóng to hitbox của RootPart (không làm biến dạng model)
-    hrp.Size = HitboxSize
-    hrp.CanCollide = false  -- tránh đẩy vật lý
-    -- Kéo theo các phần khác (tay, chân) để không bị lỗi nếu muốn
-    for _, child in ipairs(char:GetChildren()) do
-        if child:IsA("BasePart") and child ~= hrp then
-            -- Không thay đổi size, chỉ bảo đảm chúng nằm gọn trong hitbox
-            -- Hoặc có thể set Size theo tỉ lệ nhỏ hơn
-        end
-    end
-end
-
--- Quét tất cả người chơi hiện tại
-for _, p in ipairs(Players:GetPlayers()) do
-    if p ~= LocalPlayer then
-        task.spawn(ExpandHitbox, p)
-    end
-end
-
--- Đón đầu khi người chơi mới xuất hiện
-Players.PlayerAdded:Connect(function(player)
-    player.CharacterAdded:Connect(function(char)
-        task.wait(0.5)  -- đợi load xong
-        ExpandHitbox(player)
-    end)
-end)
-
--- Lặp lại mỗi 5 giây để fix các phần bị reset
-task.spawn(function()
-    while true do
-        task.wait(5)
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= LocalPlayer then
-                pcall(ExpandHitbox, p)
-            end
-        end
-    end
-end)
-
--- ===== Ẩn người chơi ở xa (giữ nguyên hitbox khi ẩn) =====
-local function HideFarPlayers()
-    local root = Character and Character:FindFirstChild("HumanoidRootPart")
-    if not root then return end
-    local myPos = root.Position
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player ~= LocalPlayer then
-            local otherChar = player.Character
-            if otherChar then
-                local otherRoot = otherChar:FindFirstChild("HumanoidRootPart")
-                if otherRoot then
-                    local dist = (myPos - otherRoot.Position).Magnitude
-                    if dist > 250 then
-                        if otherChar.Parent == Workspace then
-                            otherChar.Parent = nil
-                        end
-                    else
-                        if otherChar.Parent == nil then
-                            otherChar.Parent = Workspace
-                            -- Khi hiện lại, áp dụng lại hitbox
-                            task.spawn(ExpandHitbox, player)
-                        end
-                    end
-                end
-            end
-        end
-    end
-end
-
-task.spawn(function()
-    while true do
-        task.wait(3)
-        pcall(HideFarPlayers)
-    end
-end)
-
--- Giải phóng RAM
-local function FreeMemory()
-    collectgarbage("collect")
-    pcall(function()
-        game:GetService("UserSettings"):GetService("UserGameSettings").GraphicsQualityLevel = Enum.QualityLevel.Level01
+        
+        -- Cập nhật camera
+        updateCamera(head.Position)
     end)
 end
 
-task.spawn(function()
-    while true do
-        task.wait(20)
-        pcall(FreeMemory)
+local function stopAimbot()
+    if aimConnection then
+        aimConnection:Disconnect()
+        aimConnection = nil
+    end
+    FOVCircle.Visible = false
+    CurrentTarget = nil
+end
+
+-- ===== THEO DÕI TOUCH ĐỂ PHÁT HIỆN VUỐT =====
+UserInputService.TouchStarted:Connect(function(input, processed)
+    if processed then return end
+    IsTouching = true
+    LastTouchDelta = Vector2.new(0, 0)
+end)
+
+UserInputService.TouchMoved:Connect(function(input, processed)
+    if processed then return end
+    if IsTouching then
+        LastTouchDelta = input.Position - input.PreviousPosition
     end
 end)
 
-print("Smart FPS Booster + Hitbox Extender đã kích hoạt")
+UserInputService.TouchEnded:Connect(function(input, processed)
+    IsTouching = false
+    LastTouchDelta = Vector2.new(0, 0)
+end)
+
+-- ===== GUI TOGGLE BUTTON (DRAGGABLE) =====
+if PlayerGui:FindFirstChild("MobileAimbotGui") then
+    PlayerGui.MobileAimbotGui:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+local ToggleButton = Instance.new("TextButton")
+local UICorner = Instance.new("UICorner")
+
+ScreenGui.Name = "MobileAimbotGui"
+ScreenGui.Parent = PlayerGui
+ScreenGui.ResetOnSpawn = false
+
+ToggleButton.Name = "ToggleButton"
+ToggleButton.Parent = ScreenGui
+ToggleButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+ToggleButton.Position = UDim2.new(0.15, 0, 0.25, 0)
+ToggleButton.Size = UDim2.new(0, 75, 0, 35)
+ToggleButton.Font = Enum.Font.SourceSansBold
+ToggleButton.Text = "TRACK: ON"
+ToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+ToggleButton.TextSize = 14
+ToggleButton.Active = true
+ToggleButton.AutoButtonColor = false
+
+UICorner.CornerRadius = UDim.new(0, 8)
+UICorner.Parent = ToggleButton
+
+-- Drag logic
+local dragData = {dragging = false, dragInput = nil, dragStart = nil, startPos = nil}
+local function updateDrag(input)
+    local delta = input.Position - dragData.dragStart
+    ToggleButton.Position = UDim2.new(
+        dragData.startPos.X.Scale,
+        dragData.startPos.X.Offset + delta.X,
+        dragData.startPos.Y.Scale,
+        dragData.startPos.Y.Offset + delta.Y
+    )
+end
+
+ToggleButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragData.dragging = true
+        dragData.dragStart = input.Position
+        dragData.startPos = ToggleButton.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragData.dragging = false
+            end
+        end)
+    end
+end)
+
+ToggleButton.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+        dragData.dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragData.dragInput and dragData.dragging then
+        updateDrag(input)
+    end
+end)
+
+-- Toggle
+ToggleButton.MouseButton1Click:Connect(function()
+    AimbotEnabled = not AimbotEnabled
+    if AimbotEnabled then
+        ToggleButton.Text = "TRACK: ON"
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(0, 200, 100)
+        FOVCircle.Visible = true
+        CurrentTarget = nil  -- reset target để quét lại
+        if not aimConnection then startAimbot() end
+    else
+        ToggleButton.Text = "TRACK: OFF"
+        ToggleButton.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+        stopAimbot()
+    end
+end)
+
+-- ===== KHỞI ĐỘNG =====
+startAimbot()
+
+-- ===== DỌN DẸP KHI THOÁT =====
+game:BindToClose(function()
+    stopAimbot()
+    if FOVCircle then FOVCircle:Remove() end
+end)
